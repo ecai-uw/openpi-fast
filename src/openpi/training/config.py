@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.franka_real_policy as franka_real_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -347,6 +348,51 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotFrankaRealDataConfig(DataConfigFactory):
+    """Data pipeline for the real single-arm Franka (FR3) teleop demos.
+
+    See openpi/policies/franka_real_policy.py for the dataset schema this expects.
+    """
+
+    # Must match what the converter wrote: 7 without the kp/kd channels, 9 with them.
+    action_dim: int = 7
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/wrist_image_2": "wrist_image_2",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[franka_real_policy.FrankaRealInputs(model_type=model_config.model_type)],
+            outputs=[franka_real_policy.FrankaRealOutputs(action_dim=self.action_dim)],
+        )
+
+        # The converter already writes per-step EEF deltas, so no DeltaActions conversion
+        # is applied here (same situation as LIBERO).
+
+        model_transforms = ModelTransformFactory()(model_config)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -781,6 +827,65 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_franka_real",
+        # Demos are 20 fps, so horizon 20 gives the same ~1s of lookahead that
+        # pi05_libero gets from horizon 10 at 10 fps.
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=20, discrete_state_input=False),
+        data=LeRobotFrankaRealDataConfig(
+            repo_id="franka_bowl",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        # ~32k frames is ~18x smaller than LIBERO-90, so the schedule is compressed:
+        # pi05_libero's 10k-step warmup would span this entire run.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=10_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+    ),
+    TrainConfig(
+        name="pi05_franka_real_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotFrankaRealDataConfig(
+            repo_id="franka_bowl",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        # LoRA wants a higher LR than full finetuning; the rest of the schedule is
+        # deliberately identical to pi05_franka_real so the two runs are comparable.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Must mirror the model config above, or the wrong parameters get frozen.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # EMA would keep a full-precision copy of the frozen (bf16-cast) params too.
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
     ),
     #
     # Fine-tuning Aloha configs.
