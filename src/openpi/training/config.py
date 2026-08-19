@@ -828,6 +828,78 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    # --- Action-space pivot A/B (see multi-fast/ACTION_SPACE_PIVOT.md) ---------
+    # Two arms over the SAME replay of libero_spatial, differing only in what the
+    # `actions` field holds: recorded OSC deltas vs the absolute pose goals those
+    # deltas produced. Everything else — weights, schedule, batch, data volume —
+    # is identical so the comparison isolates the action space.
+    #
+    # Both start from pi05_base rather than pi05_libero on purpose: pi05_libero is
+    # already a delta-LIBERO model, so warm-starting would hand the delta arm a
+    # large head start while the target arm had to unlearn its action space.
+    #
+    # Schedule is compressed relative to pi05_libero (10k warmup / 30k steps).
+    # That recipe is sized for the 4-suite mix; libero_spatial alone is ~54k
+    # frames, so a 10k-step warmup would cover most of the run — same reasoning
+    # as pi05_franka_real below.
+    TrainConfig(
+        name="pi05_libero4_delta",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero4_delta",
+            base_config=DataConfig(prompt_from_task=True),
+            # LIBERO's recorded actions are already deltas.
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        # Identical to pi05_libero: libero4_* is the same four no_noops suites
+        # that `physical-intelligence/libero` is built from (278,091 frames =
+        # 1086 steps/epoch at bs256, so 30k steps is ~27.6 epochs), so their
+        # recipe transfers directly with no rescaling.
+        # Note their decay is INERT — peak_lr == decay_lr with decay_steps 33x
+        # the run length, i.e. warmup then a flat 5e-5. Kept identical here.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero4_target",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero4_target",
+            base_config=DataConfig(prompt_from_task=True),
+            # Actions are ABSOLUTE pose goals here, so the delta transform is on:
+            # it subtracts the chunk-start state from dims 0:6 (gripper left
+            # absolute), which is exactly the chunk-relative target encoding.
+            # Requires goal_ori stored in the state's body frame — the converter
+            # does this; site-frame goals would poison the subtraction.
+            extra_delta_transform=True,
+        ),
+        batch_size=256,
+        # Identical to pi05_libero: libero4_* is the same four no_noops suites
+        # that `physical-intelligence/libero` is built from (278,091 frames =
+        # 1086 steps/epoch at bs256, so 30k steps is ~27.6 epochs), so their
+        # recipe transfers directly with no rescaling.
+        # Note their decay is INERT — peak_lr == decay_lr with decay_steps 33x
+        # the run length, i.e. warmup then a flat 5e-5. Kept identical here.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
     TrainConfig(
         name="pi05_franka_real",
         # Demos are 20 fps, so horizon 20 gives the same ~1s of lookahead that
