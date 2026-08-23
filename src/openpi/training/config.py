@@ -900,6 +900,33 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
+    # Target-EEF counterpart to pi05_libero90 (see multi-fast/ACTION_SPACE_PIVOT.md).
+    # No delta twin is needed here: pi05_libero90 was trained on libero_90_no_noops,
+    # which libero_90_relabeled reproduces bit-identically (actions/ee_pos/ee_ori),
+    # under this exact recipe — so it already serves as the control. That differs
+    # from the libero4 pair, where the delta baseline had PI's provenance.
+    TrainConfig(
+        name="pi05_libero90_target",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero90_target",
+            base_config=DataConfig(prompt_from_task=True),
+            # Actions are absolute pose goals; DeltaActions subtracts the
+            # chunk-start state from dims 0:6, leaving the gripper absolute.
+            extra_delta_transform=True,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
     TrainConfig(
         name="pi05_franka_real",
         # Demos are 20 fps, so horizon 20 gives the same ~1s of lookahead that
