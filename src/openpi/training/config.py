@@ -289,6 +289,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
     extra_delta_transform: bool = False
 
+    # Chunk-start-relative target actions in OSC units. Mutually exclusive with
+    # extra_delta_transform -- both rewrite the pose channels against the state.
+    chunk_relative_transform: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # The repack transform is *only* applied to the data coming from the dataset,
@@ -336,11 +340,24 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
         # LIBERO already represents actions as deltas, but we have some old Pi0 checkpoints that are trained with this
         # extra delta transform.
+        if self.extra_delta_transform and self.chunk_relative_transform:
+            raise ValueError(
+                "extra_delta_transform and chunk_relative_transform are mutually exclusive"
+            )
         if self.extra_delta_transform:
             delta_action_mask = _transforms.make_bool_mask(6, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Absolute world pose goals -> chunk-start-relative offsets in OSC units.
+        # No output transform on purpose: the model's output IS that representation,
+        # and the env wrapper reconstructs world targets from the chunk-start anchor
+        # so the RL residual composes in OSC units. See PI05_TARGET_ROTATION.md.
+        if self.chunk_relative_transform:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.ChunkRelativePoseActions()],
             )
 
         # Model transforms include things like tokenizing the prompt and action targets
@@ -889,6 +906,35 @@ _CONFIGS = [
         # recipe transfers directly with no rescaling.
         # Note their decay is INERT — peak_lr == decay_lr with decay_steps 33x
         # the run length, i.e. warmup then a flat 5e-5. Kept identical here.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # Supersedes pi05_libero4_target: same dataset, correct rotation encoding.
+    # pi05_libero4_target composes with DeltaActions, which SUBTRACTS axis-angle
+    # vectors elementwise — geometrically meaningless for rotations. This config
+    # swaps that for a rotation composition (R_goal @ R_state^T) and emits both
+    # channels in OSC units. The old config is kept intact so its checkpoint stays
+    # evaluable: create_trained_policy rebuilds transforms from the live config.
+    TrainConfig(
+        name="pi05_libero4_chunkrel",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            # Same dataset as pi05_libero4_target — it stores absolute goals, and the
+            # anchor varies per sampled chunk start, so the encoding must be a
+            # train-time transform rather than something baked into the conversion.
+            repo_id="libero4_target",
+            base_config=DataConfig(prompt_from_task=True),
+            chunk_relative_transform=True,
+        ),
+        batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,

@@ -244,6 +244,86 @@ class AbsoluteActions(DataTransformFn):
         return data
 
 
+def _axisangle_to_mat(vec: np.ndarray) -> np.ndarray:
+    """Rodrigues, vectorized over arbitrary leading dims. (..., 3) -> (..., 3, 3)."""
+    theta = np.linalg.norm(vec, axis=-1, keepdims=True)
+    axis = np.divide(vec, theta, out=np.zeros_like(vec), where=theta > 0.0)
+    K = np.zeros((*vec.shape[:-1], 3, 3), dtype=np.float64)
+    K[..., 0, 1], K[..., 0, 2] = -axis[..., 2], axis[..., 1]
+    K[..., 1, 0], K[..., 1, 2] = axis[..., 2], -axis[..., 0]
+    K[..., 2, 0], K[..., 2, 1] = -axis[..., 1], axis[..., 0]
+    sin, cos = np.sin(theta)[..., None], np.cos(theta)[..., None]
+    return np.eye(3) + sin * K + (1.0 - cos) * (K @ K)
+
+
+def _mat_to_axisangle(mat: np.ndarray) -> np.ndarray:
+    """Inverse of `_axisangle_to_mat`, canonical theta in [0, pi]. (..., 3, 3) -> (..., 3)."""
+    trace = np.clip((mat[..., 0, 0] + mat[..., 1, 1] + mat[..., 2, 2] - 1.0) * 0.5, -1.0, 1.0)
+    theta = np.arccos(trace)
+    skew = np.stack(
+        [
+            mat[..., 2, 1] - mat[..., 1, 2],
+            mat[..., 0, 2] - mat[..., 2, 0],
+            mat[..., 1, 0] - mat[..., 0, 1],
+        ],
+        axis=-1,
+    )
+    norm = np.linalg.norm(skew, axis=-1, keepdims=True)  # == 2*sin(theta)
+    axis = np.divide(skew, norm, out=np.zeros_like(skew), where=norm > 1e-8)
+    # The skew part vanishes at BOTH theta=0 (axis irrelevant) and theta=pi, where
+    # the axis has to come from the symmetric part instead: (R + I)/2 == k k^T.
+    near_pi = (norm[..., 0] <= 1e-8) & (theta > 1.0)
+    if np.any(near_pi):
+        sym = (mat[near_pi] + np.eye(3)) * 0.5
+        diag = np.clip(np.einsum("...ii->...i", sym), 0.0, None)
+        col = sym[np.arange(sym.shape[0]), :, np.argmax(diag, axis=-1)]
+        axis[near_pi] = col / (np.linalg.norm(col, axis=-1, keepdims=True) + 1e-12)
+    return axis * theta[..., None]
+
+
+@dataclasses.dataclass(frozen=True)
+class ChunkRelativePoseActions(DataTransformFn):
+    """Repacks absolute world pose goals into chunk-start-relative offsets, in OSC units.
+
+    Position becomes a translation offset from the chunk-start state. Orientation
+    becomes the rotation COMPOSITION ``R_goal @ R_state^T`` -- not the elementwise
+    axis-angle subtraction ``DeltaActions`` performs, which is geometrically
+    meaningless for rotations. The gripper channel stays absolute.
+
+    Both channels are divided by the OSC controller's ``output_max`` so the model
+    emits the same units the reach base policy already does, letting the residual
+    RL policy compose with either base in one convention. These are NOT bounded to
+    [-1, 1]: output_max normalizes a single control step, while a chunk-relative
+    offset spans up to `action_horizon` of them.
+
+    There is deliberately no inverse transform -- the model's output *is* this
+    representation, and the env wrapper reconstructs world targets from the
+    chunk-start anchor. See multi-fast/PI05_TARGET_ROTATION.md.
+    """
+
+    # robosuite OSC_POSE defaults; must match the controller the policy runs under.
+    pos_scale: float = 0.05
+    rot_scale: float = 0.5
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data:
+            return data  # inference: the input dict carries no actions
+
+        state = np.asarray(data["state"], dtype=np.float64)
+        actions = np.asarray(data["actions"])
+        out = np.array(actions, dtype=np.float64)
+
+        out[..., :3] = (out[..., :3] - state[..., None, :3]) / self.pos_scale
+
+        rot_state = _axisangle_to_mat(state[..., 3:6])
+        rot_goal = _axisangle_to_mat(out[..., 3:6])
+        rot_rel = rot_goal @ np.swapaxes(rot_state, -1, -2)[..., None, :, :]
+        out[..., 3:6] = _mat_to_axisangle(rot_rel) / self.rot_scale
+
+        data["actions"] = out.astype(actions.dtype)
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
