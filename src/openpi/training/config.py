@@ -973,6 +973,29 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
+    # Chunk-relative counterpart to pi05_libero90_target, same swap as
+    # pi05_libero4_chunkrel: rotation composition in OSC units instead of
+    # DeltaActions' elementwise axis-angle subtraction.
+    TrainConfig(
+        name="pi05_libero90_chunkrel",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero90_target",
+            base_config=DataConfig(prompt_from_task=True),
+            chunk_relative_transform=True,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
     TrainConfig(
         name="pi05_franka_real",
         # Demos are 20 fps, so horizon 20 gives the same ~1s of lookahead that
